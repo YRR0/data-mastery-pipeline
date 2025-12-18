@@ -1,0 +1,115 @@
+# Configuration centralisée du pipeline
+
+# Ingestion
+ingestion:
+  cities:
+    - Paris
+    - London
+    - New York
+    - Tokyo
+    - Sydney
+  fetch_interval_seconds: 3600  # 1 heure
+  batch_size: 100
+
+# Kafka
+kafka:
+  bootstrap_servers: ${KAFKA_BOOTSTRAP_SERVERS}
+  topic_weather: ${KAFKA_TOPIC_WEATHER}
+  consumer_group: weather-consumer-group
+  auto_offset_reset: earliest
+  compression_type: gzip
+
+# Storage
+storage:
+  minio:
+    endpoint: ${MINIO_ENDPOINT}
+    access_key: ${MINIO_ACCESS_KEY}
+    secret_key: ${MINIO_SECRET_KEY}
+    secure: ${MINIO_SECURE}
+    buckets:
+      bronze: ${MINIO_BUCKET_BRONZE}
+      silver: ${MINIO_BUCKET_SILVER}
+  
+  bronze:
+    format: parquet
+    partition_by: 
+      - year
+      - month
+      - day
+    compression: snappy
+  
+  silver:
+    format: parquet
+    partition_by:
+      - year
+      - month
+    compression: snappy
+
+# Processing
+processing:
+  spark:
+    master: ${SPARK_MASTER}
+    app_name: ${SPARK_APP_NAME}
+    config:
+      spark.sql.adaptive.enabled: true
+      spark.sql.adaptive.coalescePartitions.enabled: true
+      spark.sql.parquet.compression.codec: snappy
+      spark.executor.memory: 2g
+      spark.driver.memory: 2g
+  
+  transformations:
+    # Filtrage des données invalides
+    filter_null_values: true
+    filter_min_temperature: -100
+    filter_max_temperature: 60
+    
+    # Agrégations
+    aggregations:
+      - type: daily
+        metrics: [avg_temp, min_temp, max_temp, avg_humidity]
+      - type: hourly
+        metrics: [avg_temp, avg_wind_speed]
+
+# Loading
+loading:
+  postgres:
+    host: ${POSTGRES_HOST}
+    port: ${POSTGRES_PORT}
+    database: ${POSTGRES_DB}
+    user: ${POSTGRES_USER}
+    password: ${POSTGRES_PASSWORD}
+    schema: ${POSTGRES_SCHEMA}
+  
+  write_mode: append  # append ou overwrite
+  batch_size: 1000
+  deduplication_key: [city, timestamp]
+
+# Orchestration
+orchestration:
+  airflow:
+    dag_id: weather_pipeline
+    schedule_interval: "0 * * * *"  # Toutes les heures
+    start_date: "2024-01-01"
+    catchup: false
+    max_active_runs: 1
+    retries: 3
+    retry_delay_minutes: 5
+
+# Monitoring
+monitoring:
+  log_level: ${LOG_LEVEL}
+  log_format: ${LOG_FORMAT}
+  enable_metrics: true
+  alert_on_failure: true
+  
+  data_quality:
+    check_null_percentage: true
+    max_null_threshold: 0.1  # 10%
+    check_duplicate_records: true
+    check_schema_changes: true
+
+# Retention
+retention:
+  bronze_days: 30
+  silver_days: 90
+  gold_days: 365
