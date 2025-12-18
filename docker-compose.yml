@@ -1,0 +1,327 @@
+version: '3.8'
+
+# =====================================================
+# Docker Compose pour le pipeline de données météo
+# Services: PostgreSQL, Kafka, Zookeeper, MinIO, Airflow, Spark
+# =====================================================
+
+x-airflow-common:
+  &airflow-common
+  image: apache/airflow:2.8.0-python3.9
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: 'Jq8F3vZ7HxK9wN2sP5tY8bC4dE6gH1jL3mN5pR7sT9vX2zA4bC6dE8gH0jL2mN4p='
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__WEBSERVER__SECRET_KEY: 'your_secret_key_here_change_in_production'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: 30
+    
+    # Variables d'environnement du pipeline
+    OPENWEATHER_API_KEY: ${OPENWEATHER_API_KEY}
+    OPENWEATHER_BASE_URL: ${OPENWEATHER_BASE_URL}
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    KAFKA_TOPIC_WEATHER: weather-data
+    MINIO_ENDPOINT: minio:9000
+    MINIO_ACCESS_KEY: minioadmin
+    MINIO_SECRET_KEY: minioadmin
+    MINIO_BUCKET_BRONZE: bronze-layer
+    MINIO_BUCKET_SILVER: silver-layer
+    MINIO_SECURE: 'false'
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: 5432
+    POSTGRES_DB: weather_dw
+    POSTGRES_USER: dataeng
+    POSTGRES_PASSWORD: dataeng123
+    
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./src:/opt/airflow/src
+    - ./config:/opt/airflow/config
+    - ./logs:/opt/airflow/logs
+    - airflow-plugins:/opt/airflow/plugins
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    - postgres
+    - kafka
+
+services:
+  
+  # =====================================================
+  # PostgreSQL - Base de données pour Airflow et Gold Layer
+  # =====================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    networks:
+      - data-pipeline-network
+
+  # =====================================================
+  # Création de la base de données weather_dw
+  # =====================================================
+  postgres-init:
+    image: postgres:15-alpine
+    container_name: postgres-init
+    environment:
+      PGPASSWORD: airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      sh -c "
+        psql -h postgres -U airflow -tc \"SELECT 1 FROM pg_database WHERE datname = 'weather_dw'\" | grep -q 1 || 
+        psql -h postgres -U airflow -c \"CREATE DATABASE weather_dw;\" &&
+        psql -h postgres -U airflow -d weather_dw -c \"CREATE USER dataeng WITH PASSWORD 'dataeng123';\" || true &&
+        psql -h postgres -U airflow -d weather_dw -c \"GRANT ALL PRIVILEGES ON DATABASE weather_dw TO dataeng;\" &&
+        psql -h postgres -U dataeng -d weather_dw -f /schema.sql
+      "
+    volumes:
+      - ./sql/schema.sql:/schema.sql
+    networks:
+      - data-pipeline-network
+
+  # =====================================================
+  # Zookeeper - Coordination pour Kafka
+  # =====================================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+    networks:
+      - data-pipeline-network
+
+  # =====================================================
+  # Kafka - Message Broker
+  # =====================================================
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_COMPRESSION_TYPE: gzip
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: kafka-topics --bootstrap-server localhost:9092 --list
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - data-pipeline-network
+
+  # =====================================================
+  # MinIO - Stockage S3-compatible (Bronze & Silver)
+  # =====================================================
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - data-pipeline-network
+
+  # =====================================================
+  # MinIO Client - Création des buckets
+  # =====================================================
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set myminio http://minio:9000 minioadmin minioadmin;
+      /usr/bin/mc mb myminio/bronze-layer --ignore-existing;
+      /usr/bin/mc mb myminio/silver-layer --ignore-existing;
+      /usr/bin/mc policy set public myminio/bronze-layer;
+      /usr/bin/mc policy set public myminio/silver-layer;
+      exit 0;
+      "
+    networks:
+      - data-pipeline-network
+
+  # =====================================================
+  # Airflow Webserver
+  # =====================================================
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    networks:
+      - data-pipeline-network
+
+  # =====================================================
+  # Airflow Scheduler
+  # =====================================================
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    networks:
+      - data-pipeline-network
+
+  # =====================================================
+  # Airflow Init - Initialisation de la base
+  # =====================================================
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins
+        airflow db init
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com \
+          --password admin
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+    networks:
+      - data-pipeline-network
+
+  # =====================================================
+  # PySpark Master (optionnel pour processing distribué)
+  # =====================================================
+  spark-master:
+    image: bitnami/spark:3.5.0
+    container_name: spark-master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "8081:8080"
+      - "7077:7077"
+    volumes:
+      - ./src:/opt/spark-apps
+      - ./config:/opt/spark-config
+    networks:
+      - data-pipeline-network
+
+  # =====================================================
+  # PySpark Worker
+  # =====================================================
+  spark-worker:
+    image: bitnami/spark:3.5.0
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    volumes:
+      - ./src:/opt/spark-apps
+      - ./config:/opt/spark-config
+    networks:
+      - data-pipeline-network
+
+  # =====================================================
+  # Kafka UI (optionnel, pour monitoring)
+  # =====================================================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "9021:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - data-pipeline-network
+
+# =====================================================
+# Volumes persistants
+# =====================================================
+volumes:
+  postgres-db-volume:
+  airflow-plugins:
+  zookeeper-data:
+  zookeeper-logs:
+  kafka-data:
+  minio-data:
+
+# =====================================================
+# Réseau
+# =====================================================
+networks:
+  data-pipeline-network:
+    driver: bridge

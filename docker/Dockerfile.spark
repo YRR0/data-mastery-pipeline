@@ -1,0 +1,29 @@
+# Dockerfile pour Spark avec dépendances personnalisées
+FROM bitnami/spark:3.5.0
+
+USER root
+
+# Installer les dépendances Python
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    python3-pip \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copier les requirements
+COPY requirements.txt /tmp/requirements.txt
+
+# Installer les packages Python
+RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
+
+# Télécharger les JARs nécessaires
+RUN wget https://repo1.maven.org/maven2/org/postgresql/postgresql/42.5.1/postgresql-42.5.1.jar \
+    -P /opt/bitnami/spark/jars/ && \
+    wget https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar \
+    -P /opt/bitnami/spark/jars/ && \
+    wget https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.367/aws-java-sdk-bundle-1.12.367.jar \
+    -P /opt/bitnami/spark/jars/
+
+USER 1001
+
+WORKDIR /opt/bitnami/spark

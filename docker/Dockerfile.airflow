@@ -1,0 +1,27 @@
+# Dockerfile pour Airflow avec dépendances personnalisées
+FROM apache/airflow:2.8.0-python3.9
+
+USER root
+
+# Installer les dépendances système
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    libpq-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+USER airflow
+
+# Copier les requirements
+COPY requirements.txt /requirements.txt
+
+# Installer les dépendances Python
+RUN pip install --no-cache-dir -r /requirements.txt
+
+# Copier les fichiers de configuration
+COPY config /opt/airflow/config
+
+# Définir le répertoire de travail
+WORKDIR /opt/airflow
